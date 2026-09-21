@@ -235,7 +235,42 @@ While MVP 1 is scoped to single-tenant deployment using functional test credenti
 
 ## **3.1. Agent Cognitive Architecture & Prompt Design**
 
-The core agent utilizes a structured **Plan-and-Execute ReAct loop**. The engine operates under a deterministic state machine:
+The core agent utilizes a structured **Plan-and-Execute ReAct (Reasoning + Acting) loop**. The cognitive architecture coordinates user prompt decomposition, short-term conversational memory in Redis, multi-step deterministic tool execution, and dual-layer safety guardrails.
+
+### **ReAct Framework & Deterministic Tool Integrations Architecture**
+
+![Enterprise HR Virtual Assistant — ReAct Loop & Deterministic Tool Integration Flow](assets/react_tools_architecture.png)
+
+#### **Architectural Execution Trace & Column Breakdown:**
+
+1. **Column 1: Employee Prompts (UI/Chat Interface):**
+   * **Inbound Prompt Capture:** Receives multi-intent employee requests (e.g., updating personal contact information while simultaneously requesting an HR policy lookup) over a secure WebSocket / REST channel.
+   * **Input Guardrail Interceptor:** Intercepts prompt injections, jailbreaks, and sensitive SPII/NRIC patterns before foundation model invocation.
+   * **Session Broker Integration:** Binds authenticated employee context (`EMP-10492`) to the conversational turn.
+
+2. **Column 2: Agent's Reasoning & Actions (Sequential Execution Rows):**
+   * **Step 1-A (Reasoning & Action 1-A):** The agent decomposes the compound prompt into two ordered sub-goals. To preserve data consistency, it prioritizes updating the employee's records before performing the policy lookup, emitting a structured tool invocation for `workweek_update_contact_info(address="123 Maple St", phone="555-0101")`.
+   * **Step 1-B (Reasoning & Action 1-B):** Upon receiving the HTTP 200 update confirmation from the tool adapter, the agent initiates the second sub-goal, emitting `policy_search_knowledge_base(query="specific policy about leave", max_chunks=3)`.
+   * **Step 1-C (Reasoning & Final Synthesis):** Ingests retrieved grounded policy chunks from the knowledge store, validates citation attribution scores (≥ 0.90), and streams the verified natural language reply with markdown deep links back to the UI.
+
+3. **Column 3: All Tools (Row-by-Row Execution Catalog):**
+   * **Row 1 (Policy RAG):** `policy_search_knowledge_base` — Hybrid vector and keyword search over approved handbook chunks.
+   * **Row 2 (WorkWeek HCM):** `workweek_get_employee_profile` — Fetches demographics, role, department, and manager hierarchy.
+   * **Row 3 (WorkWeek HCM):** `workweek_update_contact_info` — Updates employee personal home address and mobile phone number.
+   * **Row 4 (WorkWeek HCM):** `workweek_get_leave_balances` — Queries accrued, used, and remaining PTO and sick leave ledgers.
+   * **Row 5 (WorkWeek HCM):** `workweek_submit_leave_request` — Pre-validates date and balance constraints and submits leave requests.
+   * **Row 6 (ServiceImmediately ITSM):** `service_immediately_get_ticket` — Queries incident status, timeline, work notes, and assignee.
+   * **Row 7 (ServiceImmediately ITSM):** `service_immediately_create_incident` — Creates HRSD, IT, or Facilities tickets with automated deduplication.
+   * **Row 8 (ServiceImmediately ITSM):** `service_immediately_add_comment` — Appends user work notes or advances ticket lifecycle state.
+
+4. **Column 4: Integration for Each Tool (Backend System Mappings):**
+   * Each tool row in Column 3 connects directly to its designated enterprise backend:
+     * **Row 1:** Vertex AI Search & Cloud Storage (`gs://altostrat-hr-policy-docs-prod/`).
+     * **Rows 2–5:** WorkWeek HCM REST APIs (`api/v1/...`) authenticated via RFC 8693 Delegated On-Behalf-Of (OBO) JWT tokens.
+     * **Rows 6–8:** ServiceImmediately ITSM REST APIs (`api/now/table/...`) with origin verification headers (`X-Origin: HR-Virtual-Assistant`).
+
+<details>
+<summary><b>Deterministic State Machine ASCII Flow (Click to expand)</b></summary>
 
 ```
 [Inbound Query] 
@@ -258,6 +293,7 @@ The core agent utilizes a structured **Plan-and-Execute ReAct loop**. The engine
 │      │                              │
 └──────┴──────────────────────────────┘
 ```
+</details>
 
 ### **System Prompt Specification & Guardrail Directives:**
 ```text
@@ -557,6 +593,55 @@ sequenceDiagram
 ---
 
 # **4. Security, Governance & Identity**
+
+### **Comprehensive 5-Tier Defense-in-Depth & Layered Security Architecture**
+
+The Altostrat HR Virtual Assistant enforces an end-to-end Zero-Trust posture segregated across five distinct physical and logical tiers. Every tier implements explicit transport security, identity verification, data-at-rest encryption, PII guardrails, and deterministic authorization checks to ensure that employees can access and modify only their own data (`caller == session.user_id`).
+
+![Enterprise HR Virtual Assistant — 5-Tier Segregated Security Architecture](assets/comprehensive_security_architecture.png)
+
+#### **5-Tier Column Breakdown & Layered Protocol Enforcements:**
+
+1. **Column 1: Employee Browser / Chat UI Tier (Client)**
+   * **Transport Security:** Mandatory TLS 1.3 over HTTPS for REST endpoints; Secure WebSockets (`wss://`) for token streaming. Enforces HTTP Strict Transport Security (HSTS: `max-age=63072000; includeSubDomains; preload`).
+   * **Authentication & Identity:** Corporate OIDC Identity Provider session issuing short-lived RS256 JWTs (5-minute / 300s lifetime with sliding renewal, 1-hour absolute max; §4.1 & §4.3.1). Session context lock binds caller `EMP-10492` (Alexander Tan) to tenant `altostrat-sg`.
+   * **Client Protection Boundaries:** Strict Content Security Policy (`frame-ancestors 'self' https://*.altostrat.com`), corporate intranet CORS whitelisting (`https://intranet.altostrat.com`), and in-memory closure token storage (zero plain storage in `localStorage` to eliminate XSS token theft).
+
+2. **Column 2: Ingress & Gateway Security Tier (Perimeter)**
+   * **Perimeter Defense:** Google Cloud Armor Layer 7 DDoS mitigation, mTLS client certificate termination, and OWASP Top-10 WAF inspection rules.
+   * **Zero-Trust Session Broker:** Cryptographically verifies JWT signatures against corporate IdP JWKS public keys, extracts verified caller claims, and injects signed `X-Caller-Context` downstream headers to Cloud Run.
+   * **Enterprise Rate Limiting & Throttling:** Cloud Armor enforces a strict perimeter rate limit of **20 requests/minute per employee** (§4.2). Downstream cluster limits are managed via Redis-backed Lua token buckets at **100 req/min for WorkWeek HCM** and **60 req/min for ServiceImmediately ITSM** (§5.5.2), rejecting bursts with `HTTP 429 Too Many Requests`.
+   * **Gate 1 (Input Guardrail - Pre-LLM):** Scans inbound queries for instruction overrides, DAN jailbreaks, and prompt leaks via Llama-Guard and Vertex AI Safety Filters. Rejects non-HR domains. Executes synchronous **Cloud DLP Redaction** at `LIKELIHOOD_POSSIBLE`, masking Singapore NRIC/FIN (`[REDACTED_NRIC]`) and clinical medical terms (`[REDACTED_MEDICAL_INFO]`) before LLM ingestion (§4.4).
+   * **Gate 7 (Output Guardrail - Post-LLM):** Enforces a minimum **Grounding Attribution Score ≥ 0.90** against retrieved policy chunks, suppressing ungrounded or hallucinated answers (§4.5). Validates markdown deep-links against authorized HR policy anchors, executes egress Cloud DLP token inspection, and filters for professional enterprise tone.
+
+3. **Column 3: Agent Runtime — Reasoning & Action (Cloud Run Orchestrator)**
+   * **Runtime Isolation:** Dedicated service account (`sa-agent-runtime@altostrat-hr.iam.gserviceaccount.com`), Serverless VPC Access Connector with **Internal VPC mTLS**, and zero public internet ingress.
+   * **Bounded ReAct Cognitive Architecture (MVP 1):** Bounded single ReAct agent graph with max 3 cognitive loops (2 LLM calls, <4s total execution, sub-10s P95 SLA under NFR-2.1; see §1.4 & Appendix 11).
+   * **Compound Intent Ordering:** Automatically decomposes compound prompts (e.g. updating contact info before searching leave policies), ensuring authoritative systems of record are updated prior to informational queries.
+   * **Ephemeral Context & State Isolation:** Memorystore Redis Basic Tier with `volatile-lru` eviction, sliding 10-turn window pruning with progressive summarization, sliding 30-minute inactivity TTL, and 2-hour hard session lifetime (§3.1.1). Encrypted at rest via **CMEK Cloud KMS** (`redis-cmek-key`). Enforces **Zero Raw PII Policy** (profile payloads and medical notes are never cached in Redis).
+   * **Cognitive Bounds & Telemetry:** Hard limit of 3 ReAct iterations prevents runaway inference loops. Turn metrics and SHA-256 prompt hashes are asynchronously flushed to BigQuery.
+
+4. **Column 4: Deterministic Tool Execution Layer (Gate 3 Middleware)**
+   * **Gate 3 Middleware Interceptor:** Intercepts all tool invocations inside Cloud Run prior to external network dispatch. Enforces Pydantic v2 strict schemas, field whitelisting, and type coercion.
+   * **Anti-IDOR Enforcement (`caller == session.user_id`):** Validates and programmatically injects `X-Employee-ID == JWT.sub`. Rejects any payload where target employee ID differs from authenticated session context (§4.1, §4.3).
+   * **8 Deterministic Pre-Execution Enforcements:**
+     - `Row 1: policy_search_knowledge_base`: Injects caller role (`allowed_roles: employee`) into server-side metadata filter + requires Grounding Attribution ≥ 0.90.
+     - `Row 2: workweek_get_employee_profile`: Read-only field projection; caller identity lock (`caller_id == employee_id`).
+     - `Row 3: workweek_update_contact_info`: E.164 phone regex (`^\+?[1-9]\d{1,14}$`); strictly disallows modification of name, salary, job title, or manager.
+     - `Row 4: workweek_get_leave_balances`: OBO token scope verification (`leaves.read`); zero raw balance caching in Redis.
+     - `Row 5: workweek_submit_leave_request`: Validates `start_date >= today`, `start_date <= end_date`, and `work_days <= remaining` balance.
+     - `Row 6: service_immediately_get_ticket`: Verifies ticket ownership (`caller_id == session.caller_id`); sanitizes internal IT work notes.
+     - `Row 7: service_immediately_create_incident`: Priority 1 emergency keyword classification validation; 48-hour duplicate ticket deduplication.
+     - `Row 8: service_immediately_add_comment`: Ticket state machine validation (`New` → `In Progress` → `Resolved`; blocks illegal transitions such as `New` → `Closed`).
+
+5. **Column 5: Enterprise Systems & Foundation Models**
+   * **Gemini 1.5 Pro (AI Core):** Google Cloud Vertex AI (`asia-southeast1`) over Private Google Access with TLS 1.3 / gRPC and Application Layer Transport Security (ALTS). Dedicated IAM `roles/aiplatform.user`. Zero customer data retained or used for foundation model training.
+   * **Vertex AI Search & Knowledge Store (RAG):** Document store (`gs://altostrat-hr-policy-docs-prod/`) protected by **VPC Service Controls (VPC-SC)** security perimeter. IAM `roles/discoveryengine.viewer` + dynamic role-based document ACL filtering. Encrypted at rest via **CMEK Cloud KMS** (`hr-policy-cmek-key`). Real-time Eventarc incremental ingestion (<60s sync).
+   * **WorkWeek HCM REST API (Profile & Leaves):** Routed through Dedicated Egress Cloud NAT with static egress IP allowlisting. Authenticated via **RFC 8693 OAuth 2.0 On-Behalf-Of (OBO)** delegated user JWTs. Eventarc sub-500ms webhook session eviction on employee offboarding (§4.3.1). AES-256 database encryption; supports `Idempotency-Key` headers for safe retries.
+   * **ServiceImmediately ITSM REST API (ITSM):** Mutual TLS (mTLS) with dedicated X.509 client certificate; signed header `X-Origin: HR-Virtual-Assistant`. Protected by **5xx Circuit Breaker** (trips to `OPEN` on 5 consecutive 5xx errors) paired with Pub/Sub Dead Letter Queue (`saga-dlq`) for compensating transaction rollback (§5.3). AES-256 transparent database encryption.
+   * **Immutable Governance & Audit (BigQuery):** Captures 100% structured turns, SHA-256 prompt hashes, tool execution arguments, latency metrics, and execution traces in `bigquery.altostrat_audit_logs.agent_trace_log`. Encrypted via **CMEK Cloud KMS**. Automated partition expiration at **730 days** (2-year statutory retention cap under Singapore PDPA §25; §4.4.1). Supports **Right to be Forgotten (RTBF)** via HMAC-SHA256 secret salt destruction (<5s cryptographic shredding; §4.4.2).
+
+---
 
 ## **4.1. Authentication Boundaries, RFC 8693 OBO Token Exchange & Delegated Scoping**
 
@@ -1327,7 +1412,7 @@ These toolkits are bound directly to the single ReAct agent graph in MVP 1. In P
 
 The transition to a Hierarchical Multi-Agent topology will be triggered if any of the following threshold conditions are met during post-MVP expansion:
 
-1. **Tool Catalog Scaling ($\ge 15$ Tools):** Ingestion of Payroll, Benefits, Facilities, Equity, and Travel domain tools causing prompt tool-definition token bloat (>4,000 tokens).
+1. **Tool Catalog Scaling (≥ 15 Tools):** Ingestion of Payroll, Benefits, Facilities, Equity, and Travel domain tools causing prompt tool-definition token bloat (>4,000 tokens).
 2. **Privilege & IAM Boundary Isolation:** Requirements for elevated service accounts (e.g., Executive Payroll Subagent running under a distinct GCP Service Account with restricted Cloud IAM permissions).
 3. **Asynchronous / Long-Running Background Agents:** Introduction of non-interactive autonomous workflows (e.g., nightly batch leave balance reconciliation, automated HR audit report generation).
 4. **Heterogeneous Model Routing:** Routing simple queries to ultra-low-cost models (Gemini Flash) while delegating complex reasoning to specialized reasoning models (Gemini Pro).
